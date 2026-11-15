@@ -9,7 +9,7 @@ export function readBody(request: IncomingMessage): Promise<Buffer> {
     request.on("data", (chunk: Buffer | string) => {
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     });
-    request.on("end", () => resolve(Buffer.concat(chunks)));
+    request.on("end", () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     request.on("error", reject);
   });
 }
@@ -43,8 +43,7 @@ function writeJson(
   const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
   response.statusCode = statusCode;
   response.setHeader("Content-Length", bytes.byteLength);
-  response.write(bytes);
-  response.end();
+  response.end(bytes);
 }
 
 export function sendJson(
@@ -60,9 +59,16 @@ export function sendJsonError(response: ServerResponse, statusCode: number, mess
   writeJson(response, statusCode, { message });
 }
 
+let lastExpectedToken: string | undefined;
+let lastExpectedAuthorization: string;
+
 export function checkAuth(request: IncomingMessage, expectedToken: string): boolean {
   const authorization = request.headers.authorization;
-  return authorization === `Bearer ${expectedToken}`;
+  if (expectedToken !== lastExpectedToken) {
+    lastExpectedToken = expectedToken;
+    lastExpectedAuthorization = `Bearer ${expectedToken}`;
+  }
+  return authorization === lastExpectedAuthorization;
 }
 
 export type ParsedRequestUrl = {
@@ -70,9 +76,17 @@ export type ParsedRequestUrl = {
   query: URLSearchParams;
 };
 
+const parsedRequestUrlCache = new Map<string, ParsedRequestUrl>();
+const parsedRequestUrlCacheLimit = 256;
+
 export function parseRequestUrl(request: IncomingMessage): ParsedRequestUrl {
+  const target = request.url ?? "";
+  const cached = parsedRequestUrlCache.get(target);
+  if (cached) return cached;
+
+  let result: ParsedRequestUrl;
   try {
-    const parsed = new URL(request.url ?? "", "http://placeholder.invalid");
+    const parsed = new URL(target, "http://placeholder.invalid");
     const segments = parsed.pathname
       .split("/")
       .filter((piece) => piece.length > 0)
@@ -83,10 +97,17 @@ export function parseRequestUrl(request: IncomingMessage): ParsedRequestUrl {
           return piece;
         }
       });
-    return { segments, query: parsed.searchParams };
+    result = { segments, query: parsed.searchParams };
   } catch {
-    return { segments: [], query: new URLSearchParams() };
+    result = { segments: [], query: new URLSearchParams() };
   }
+
+  parsedRequestUrlCache.set(target, result);
+  if (parsedRequestUrlCache.size > parsedRequestUrlCacheLimit) {
+    const oldestTarget = parsedRequestUrlCache.keys().next().value;
+    if (oldestTarget !== undefined) parsedRequestUrlCache.delete(oldestTarget);
+  }
+  return result;
 }
 
 export function paginate<T>(

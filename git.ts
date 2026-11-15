@@ -53,7 +53,19 @@ interface ReceiveResult {
 }
 
 const zeroHash = '0000000000000000000000000000000000000000';
-const fetchCache = new Map<string, FetchCacheEntry>();
+const fetchCache = new Map<string, Buffer>();
+
+function repositoryFingerprint(repository: Repository): string {
+  const refs = [...repository.refs.entries()].sort(([a], [b]) => a.localeCompare(b));
+  const objects = [...repository.objects.keys()].sort();
+  return JSON.stringify([repository.defaultBranch, refs, objects]);
+}
+
+function cacheResponse(key: string, response: Buffer): Buffer {
+  if (fetchCache.size > 64) fetchCache.delete(fetchCache.keys().next().value!);
+  fetchCache.set(key, response);
+  return response;
+}
 
 function packetText(text: string): Buffer {
   return encodePacketLine(text);
@@ -66,8 +78,13 @@ function joinPackets(packets: Buffer[]): Buffer {
 function sideband(bytes: Buffer): Buffer[] {
   const packets: Buffer[] = [];
   for (let offset = 0; offset < bytes.length; offset += 65515) {
-    const chunk = bytes.subarray(offset, Math.min(offset + 65515, bytes.length));
-    packets.push(encodePacketLine(Buffer.concat([Buffer.from([1]), chunk])));
+    const chunkLength = Math.min(65515, bytes.length - offset);
+    const total = chunkLength + 5;
+    const packet = Buffer.allocUnsafe(total);
+    packet.write(total.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    packet[4] = 1;
+    bytes.copy(packet, 5, offset, offset + chunkLength);
+    packets.push(packet);
   }
   return packets;
 }
@@ -188,6 +205,9 @@ function receiveAdvertisement(repository: Repository): Buffer {
 }
 
 function refListing(repository: Repository, args: string[]): Buffer {
+  const key = JSON.stringify(['refs', repositoryFingerprint(repository), args]);
+  const cached = fetchCache.get(key);
+  if (cached) return cached;
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const prefixes = args.filter((line) => line.startsWith('ref-prefix ')).map((line) => line.slice(11));
@@ -209,7 +229,7 @@ function refListing(repository: Repository, args: string[]): Buffer {
     .filter(({ name }) => !prefixes.length || prefixes.some((prefix) => name.startsWith(prefix)))
     .map(({ line }) => packetText(`${line}\n`));
   packets.push(Buffer.from(PACKET_LINE_FLUSH));
-  return joinPackets(packets);
+  return cacheResponse(key, joinPackets(packets));
 }
 
 function commitBoundaryWalk(repository: Repository, tips: string[], boundaries: Set<string>): Set<string> {
@@ -286,12 +306,6 @@ function shallowFetch(repository: Repository, wants: string[], depth: number): {
 }
 
 function fetchResult(repository: Repository, wants: string[], haves: string[], requestShallow: string[], depth?: number): FetchCacheEntry {
-  const refs = [...repository.refs.entries()].sort(([a], [b]) => a.localeCompare(b));
-  const fingerprint = `${refs.map(([name, hash]) => `${name}=${hash}`).join(',')}#${repository.objects.size}`;
-  const key = [fingerprint, [...wants].sort().join(','), [...haves].sort().join(','), [...requestShallow].sort().join(','), depth === undefined ? 'none' : String(depth)].join('|');
-  const cached = fetchCache.get(key);
-  if (cached) return cached;
-
   const held = commitBoundaryWalk(repository, haves, new Set(requestShallow));
   let send: Set<string>;
   let shallow: string[] = [];
@@ -316,8 +330,6 @@ function fetchResult(repository: Repository, wants: string[], haves: string[], r
     if (object) objects.push(object);
   }
   const entry = { pack: writePack(objects), shallow: shallow.sort(), unshallow: unshallow.sort() };
-  if (fetchCache.size > 64) fetchCache.delete(fetchCache.keys().next().value!);
-  fetchCache.set(key, entry);
   return entry;
 }
 
@@ -335,6 +347,9 @@ function fetchResponse(repository: Repository, args: string[]): Buffer {
       if (Number.isFinite(value) && value > 0) depth = Math.floor(value);
     }
   }
+  const key = JSON.stringify(['fetch', repositoryFingerprint(repository), [...wants].sort(), [...haves].sort(), [...requestShallow].sort(), depth ?? null]);
+  const cached = fetchCache.get(key);
+  if (cached) return cached;
   const result = fetchResult(repository, wants, haves, requestShallow, depth);
   const storedHaves = haves.filter((hash) => getObject(repository, hash));
   const packets: Buffer[] = [];
@@ -351,7 +366,7 @@ function fetchResponse(repository: Repository, args: string[]): Buffer {
     packets.push(Buffer.from(PACKET_LINE_DELIM));
   }
   packets.push(packetText('packfile\n'), ...sideband(result.pack), Buffer.from(PACKET_LINE_FLUSH));
-  return joinPackets(packets);
+  return cacheResponse(key, joinPackets(packets));
 }
 
 function receiveLines(body: Buffer): { lines: string[]; offset: number; valid: boolean } {

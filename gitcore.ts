@@ -44,17 +44,15 @@ const DIR_MODE = '40000';
 const GITLINK_MODE = '160000';
 const utf8 = new TextEncoder();
 const utf8Decoder = new TextDecoder();
+const COMMIT_HEADER_SEPARATOR = Buffer.from('\n\n');
 
 export const PACKET_LINE_FLUSH = Buffer.from('0000', 'ascii');
 export const PACKET_LINE_DELIM = Buffer.from('0001', 'ascii');
 export const PACKET_LINE_RESPONSE_END = Buffer.from('0002', 'ascii');
 
-function objectFrame(type: string, payload: Buffer): Buffer {
-  return Buffer.concat([utf8.encode(`${type} ${payload.length}\0`), payload]);
-}
-
 export function hashObject(type: string, payload: Buffer): string {
-  return createHash('sha1').update(objectFrame(type, payload)).digest('hex');
+  const header = utf8.encode(`${type} ${payload.length}\0`);
+  return createHash('sha1').update(header).update(payload).digest('hex');
 }
 
 export function storeObject(repository: GitRepository, type: string, payload: Buffer): string {
@@ -68,7 +66,7 @@ export function getObject(repository: GitRepository, hash: string): StoredObject
 }
 
 export function parseCommit(payload: Buffer): ParsedCommit {
-  const bytes = payload.indexOf(Buffer.from('\n\n'));
+  const bytes = payload.indexOf(COMMIT_HEADER_SEPARATOR);
   const headerBytes = bytes < 0 ? payload : payload.subarray(0, bytes);
   const message = bytes < 0 ? '' : utf8Decoder.decode(payload.subarray(bytes + 2));
   const headers = utf8Decoder.decode(headerBytes).split('\n');
@@ -250,7 +248,10 @@ export function encodePacketLine(payload: string | Buffer): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(utf8.encode(payload)) : payload;
   const total = body.length + 4;
   if (total > 65520) throw new Error('packet line too long');
-  return Buffer.concat([Buffer.from(total.toString(16).padStart(4, '0'), 'ascii'), body]);
+  const packet = Buffer.allocUnsafe(total);
+  packet.write(total.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  body.copy(packet, 4);
+  return packet;
 }
 
 export function decodePacketLines(bytes: Buffer): DecodedPacketLine[] {
@@ -368,7 +369,110 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return Buffer.concat(chunks, targetSize);
 }
 
-function inflatePackStream(bytes: Buffer, start: number, end: number): { data: Buffer; length: number } {
+function findZlibStreamEnd(bytes: Buffer, start: number, end: number): number {
+  if (start < 0 || start + 2 > end) throw new Error('truncated zlib header');
+  let bitOffset = start * 8;
+  const readBits = (count: number): number => {
+    if (count < 0 || count > 24 || bitOffset + count > end * 8) throw new Error('truncated deflate stream');
+    let value = 0;
+    for (let i = 0; i < count; i += 1) value |= ((bytes[bitOffset >> 3] >> (bitOffset & 7)) & 1) << i, bitOffset += 1;
+    return value;
+  };
+  const header = (bytes[start] << 8) | bytes[start + 1];
+  if (start + 2 > end || (bytes[start] & 15) !== 8 || (bytes[start] >> 4) > 7 || header % 31 !== 0 || (bytes[start + 1] & 32)) throw new Error('invalid zlib header');
+  bitOffset += 16;
+  const makeTable = (lengths: number[]): Map<number, number> => {
+    const max = Math.max(...lengths);
+    if (!max || max > 15) throw new Error('invalid Huffman table');
+    const counts = new Array(max + 1).fill(0);
+    for (const length of lengths) if (length) counts[length] += 1;
+    const next = new Array(max + 1).fill(0);
+    let code = 0;
+    for (let len = 1; len <= max; len += 1) { code = (code + (counts[len - 1] || 0)) << 1; next[len] = code; }
+    const table = new Map<number, number>();
+    for (let symbol = 0; symbol < lengths.length; symbol += 1) {
+      const len = lengths[symbol];
+      if (!len) continue;
+      let canonical = next[len]++;
+      let reversed = 0;
+      for (let i = 0; i < len; i += 1) { reversed = (reversed << 1) | (canonical & 1); canonical >>= 1; }
+      table.set((len << 16) | reversed, symbol);
+    }
+    return table;
+  };
+  const decode = (table: Map<number, number>): number => {
+    let code = 0;
+    for (let len = 1; len <= 15; len += 1) {
+      code |= readBits(1) << (len - 1);
+      const symbol = table.get((len << 16) | code);
+      if (symbol !== undefined) return symbol;
+    }
+    throw new Error('invalid Huffman code');
+  };
+  const fixedLit = makeTable(Array.from({ length: 288 }, (_, i) => i <= 143 ? 8 : i <= 255 ? 9 : i <= 279 ? 7 : 8));
+  const fixedDist = makeTable(new Array(32).fill(5));
+  const order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+  const lengthExtra = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+  const distExtra = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+  let final = 0;
+  do {
+    final = readBits(1);
+    const type = readBits(2);
+    if (type === 0) {
+      bitOffset = (bitOffset + 7) & ~7;
+      const len = readBits(16), nlen = readBits(16);
+      if ((len ^ 0xffff) !== nlen) throw new Error('invalid stored block length');
+      if (bitOffset + len * 8 > end * 8) throw new Error('truncated stored block');
+      bitOffset += len * 8;
+      continue;
+    }
+    if (type === 3) throw new Error('invalid deflate block type');
+    let lit = fixedLit, dist = fixedDist;
+    if (type === 2) {
+      const hlit = readBits(5) + 257, hdist = readBits(5) + 1, hclen = readBits(4) + 4;
+      if (hlit > 286 || hdist > 32) throw new Error('invalid dynamic Huffman counts');
+      const cl = new Array(19).fill(0);
+      for (let i = 0; i < hclen; i += 1) cl[order[i]] = readBits(3);
+      const ct = makeTable(cl), all: number[] = [];
+      while (all.length < hlit + hdist) {
+        const sym = decode(ct);
+        if (sym <= 15) all.push(sym);
+        else {
+          const repeat = sym === 16 ? readBits(2) + 3 : sym === 17 ? readBits(3) + 3 : sym === 18 ? readBits(7) + 11 : 0;
+          if (!repeat || all.length + repeat > hlit + hdist || (sym === 16 && !all.length)) throw new Error('invalid code length repeat');
+          const value = sym === 16 ? all[all.length - 1] : 0;
+          for (let i = 0; i < repeat; i += 1) all.push(value);
+        }
+      }
+      if (!all[256]) throw new Error('missing end-of-block code');
+      lit = makeTable(all.slice(0, hlit)); dist = makeTable(all.slice(hlit));
+    }
+    for (;;) {
+      const symbol = decode(lit);
+      if (symbol < 256) continue;
+      if (symbol === 256) break;
+      if (symbol < 257 || symbol > 285) throw new Error('invalid length symbol');
+      readBits(lengthExtra[symbol - 257]);
+      const ds = decode(dist);
+      if (ds > 29) throw new Error('invalid distance symbol');
+      readBits(distExtra[ds]);
+    }
+  } while (!final);
+  bitOffset = (bitOffset + 7) & ~7;
+  const result = bitOffset / 8 + 4;
+  if (result > end) throw new Error('truncated zlib checksum');
+  return result;
+}
+
+function inflatePackStream(bytes: Buffer, start: number, end: number, declaredSize: number): { data: Buffer; length: number } {
+  try {
+    const streamEnd = findZlibStreamEnd(bytes, start, end);
+    const data = inflateSync(bytes.subarray(start, streamEnd));
+    if (data.length !== declaredSize) throw new Error('pack entry size mismatch');
+    return { data, length: streamEnd - start };
+  } catch {
+    // Preserve the previous search behavior for malformed or unsupported streams.
+  }
   const remaining = end - start;
   let failure = 0;
   let success = remaining;
@@ -426,7 +530,7 @@ export function readPack(repository: GitRepository | null, pack: Buffer): PackOb
       entry.baseHash = pack.subarray(state.offset, state.offset + 20).toString('hex');
       state.offset += 20;
     }
-    const inflated = inflatePackStream(pack, state.offset, trailerStart);
+    const inflated = inflatePackStream(pack, state.offset, trailerStart, size);
     if (inflated.data.length !== size) throw new Error('pack entry size mismatch');
     entry.data = inflated.data;
     state.offset += inflated.length;
